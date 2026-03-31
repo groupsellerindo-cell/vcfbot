@@ -1,6 +1,8 @@
 import os
 import asyncio
 import re
+from threading import Thread
+from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, ForceReply
 
@@ -220,27 +222,21 @@ async def handle_docs(c, m):
         base, ext = os.path.splitext(m.document.file_name)
         user_data[uid]['original_names'].append(base)
         if st == S_COLLECTING_RENAME: user_data[uid]['exts'].append(ext)
-        try:
-            await m.delete()
-        except:
-            pass
+        try: await m.delete()
+        except: pass
 
     elif st in [S_COLLECTING_MERGE_VCF, S_COLLECTING_MERGE_TXT]:
         path = await m.download()
         user_data[uid]['files'].append(path)
-        try:
-            await m.delete()
-        except:
-            pass
+        try: await m.delete()
+        except: pass
 
     elif st == S_SPLIT_FILE:
         msg = await m.reply("🔄 **Analyzing File...**")
         path = await m.download()
         base, ext = os.path.splitext(m.document.file_name)
-        try:
-            await m.delete()
-        except:
-            pass
+        try: await m.delete()
+        except: pass
         
         is_vcf = path.endswith(".vcf")
         count = 0
@@ -249,10 +245,8 @@ async def handle_docs(c, m):
             count = content.count("BEGIN:VCARD") if is_vcf else len(content.splitlines())
         
         user_data[uid].update({'state': S_SPLIT_COUNT, 'path': path, 'is_vcf': is_vcf, 'total_items': count, 'original_name': base})
-        try:
-            await msg.delete() 
-        except:
-            pass
+        try: await msg.delete() 
+        except: pass
         await m.reply(f"📊 **Analysis Complete.**\n\n**Total Numbers:** `{count}`\n\n🔢 **Enter how many per file?**")
 
 # --- CALLBACKS ---
@@ -297,20 +291,13 @@ async def cb_handler(c, q):
 
     elif data == "name_custom":
         msg_text = "✏️ **Enter Custom File Name:**"
-        if st == S_T2V_FILE_MODE:
-            user_data[uid]['state'] = S_T2V_CUSTOM_NAME; await q.message.edit(msg_text)
-        elif st == S_V2T_MODE:
-            user_data[uid]['state'] = S_V2T_CUSTOM; await q.message.edit(msg_text)
-        elif st == S_RENAME_MODE:
-            user_data[uid]['state'] = S_RENAME_CUSTOM; await q.message.edit(msg_text)
-        elif st == S_SPLIT_MODE:
-            user_data[uid]['state'] = S_SPLIT_CUSTOM; await q.message.edit(msg_text)
-        elif st == S_REN_CTC_MODE:
-            user_data[uid]['state'] = S_REN_CTC_CUSTOM; await q.message.edit(msg_text)
-        elif st == S_MERGE_VCF_MODE:
-            user_data[uid]['state'] = S_MERGE_VCF_CUSTOM; await q.message.edit(msg_text)
-        elif st == S_MERGE_TXT_MODE:
-            user_data[uid]['state'] = S_MERGE_TXT_CUSTOM; await q.message.edit(msg_text)
+        if st == S_T2V_FILE_MODE: user_data[uid]['state'] = S_T2V_CUSTOM_NAME; await q.message.edit(msg_text)
+        elif st == S_V2T_MODE: user_data[uid]['state'] = S_V2T_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_RENAME_MODE: user_data[uid]['state'] = S_RENAME_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_SPLIT_MODE: user_data[uid]['state'] = S_SPLIT_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_REN_CTC_MODE: user_data[uid]['state'] = S_REN_CTC_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_MERGE_VCF_MODE: user_data[uid]['state'] = S_MERGE_VCF_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_MERGE_TXT_MODE: user_data[uid]['state'] = S_MERGE_TXT_CUSTOM; await q.message.edit(msg_text)
 
 # --- TEXT HANDLER ---
 @app.on_message(filters.text)
@@ -352,7 +339,6 @@ async def text_handler(c, m):
         fname = m.text.strip()
         if not fname.endswith(".txt"): fname += ".txt"
         
-        # Adding + logically for Message to TXT if lines contain numbers
         msg_content = user_data[uid]['msg_content']
         new_content = ""
         for line in msg_content.splitlines():
@@ -392,7 +378,6 @@ async def text_handler(c, m):
             if not l: continue
             if l.replace('+','').isdigit() and len(l)>5:
                 if tn:
-                    # Plus Sign Magic Here
                     clean_num = "+" + l.replace('+', '')
                     vcf+=f"BEGIN:VCARD\nVERSION:3.0\nFN:{tn}\nTEL;TYPE=CELL:{clean_num}\nEND:VCARD\n"
                     tn=None
@@ -421,7 +406,6 @@ async def process_t2v(c, m, uid, custom):
             for num in lines:
                 num = num.strip()
                 if num: 
-                    # Plus Sign Magic Here
                     clean_num = "+" + num.replace('+', '')
                     data += f"BEGIN:VCARD\nVERSION:3.0\nFN:{c_name_base} {counter}\nTEL;TYPE=CELL:{clean_num}\nEND:VCARD\n"
                     counter += 1
@@ -430,10 +414,8 @@ async def process_t2v(c, m, uid, custom):
             await m.reply_document(out_name)
             
             if i == 0:
-                try:
-                    await proc_msg.delete()
-                except:
-                    pass
+                try: await proc_msg.delete()
+                except: pass
             
             os.remove(out_name)
             os.remove(path)
@@ -443,7 +425,7 @@ async def process_t2v(c, m, uid, custom):
     await reset_user(uid)
 
 async def process_ren_ctc(c, m, uid, custom):
-    proc_msg = await m.reply("⚙️ **Renaming Contacts (Sequential) & Adding Plus Sign...**")
+    proc_msg = await m.reply("⚙️ **Renaming Contacts & Adding Plus Sign...**")
     files = user_data[uid]['files']
     new_c_name_base = user_data[uid]['c_name']
     
@@ -459,7 +441,6 @@ async def process_ren_ctc(c, m, uid, custom):
                         new_content += f"FN:{new_c_name_base} {counter}\n"
                         counter += 1
                     elif "TEL" in line and ":" in line:
-                        # Plus Sign Magic Here
                         parts = line.split(":", 1)
                         clean_num = "+" + parts[1].strip().replace('+', '')
                         new_content += f"{parts[0]}:{clean_num}\n"
@@ -470,10 +451,8 @@ async def process_ren_ctc(c, m, uid, custom):
             await m.reply_document(out_name)
             
             if i == 0:
-                try:
-                    await proc_msg.delete()
-                except:
-                    pass
+                try: await proc_msg.delete()
+                except: pass
             
             os.remove(out_name)
             os.remove(path)
@@ -492,12 +471,10 @@ async def process_split(c, m, uid, custom):
         with open(path, 'r', encoding='utf-8', errors='ignore') as f: content = f.read()
 
         if is_vcf:
-            # Add Plus Sign to all VCF Numbers
             content = re.sub(r'(TEL.*?:)\s*\+?(\d+)', r'\1+\2', content)
             items = [x+"END:VCARD\n" for x in content.strip().split("END:VCARD") if "BEGIN:VCARD" in x]
             ext = ".vcf"
         else:
-            # Add Plus Sign to all TXT Numbers
             raw_items = content.splitlines()
             items = []
             for x in raw_items:
@@ -518,10 +495,8 @@ async def process_split(c, m, uid, custom):
             await m.reply_document(out_name)
             
             if i == 0:
-                try:
-                    await proc_msg.delete()
-                except:
-                    pass
+                try: await proc_msg.delete()
+                except: pass
             
             os.remove(out_name)
         os.remove(path)
@@ -540,7 +515,6 @@ async def process_v2t(c, m, uid, custom):
                 for l in f:
                     if "TEL" in l: 
                         raw_num = l.split(':')[-1].strip()
-                        # Plus Sign Magic Here
                         clean_num = "+" + raw_num.replace('+', '')
                         nums.append(clean_num)
             
@@ -548,10 +522,8 @@ async def process_v2t(c, m, uid, custom):
             await m.reply_document(out_name)
             
             if i == 0:
-                try:
-                    await proc_msg.delete()
-                except:
-                    pass
+                try: await proc_msg.delete()
+                except: pass
             
             os.remove(out_name)
             os.remove(path)
@@ -570,10 +542,8 @@ async def process_rename(c, m, uid, custom):
             await m.reply_document(new_name)
             
             if i == 0:
-                try:
-                    await proc_msg.delete()
-                except:
-                    pass
+                try: await proc_msg.delete()
+                except: pass
             
             os.remove(new_name)
         await m.reply("✅ **All Files Done.**")
@@ -590,24 +560,20 @@ async def process_merge(c, m, uid, custom, ext):
                 with open(path, 'r', encoding='utf-8', errors='ignore') as infile:
                     if ext == ".vcf":
                         content = infile.read()
-                        # Add Plus Sign to VCF Numbers
                         content = re.sub(r'(TEL.*?:)\s*\+?(\d+)', r'\1+\2', content)
                         outfile.write(content)
                     else:
                         for line in infile:
                             line = line.strip()
                             if line:
-                                # Add Plus Sign to TXT Numbers
                                 if line.replace('+', '').isdigit():
                                     outfile.write("+" + line.replace('+', '') + "\n")
                                 else:
                                     outfile.write(line + "\n")
                 os.remove(path)
         
-        try:
-            await proc_msg.delete()
-        except:
-            pass
+        try: await proc_msg.delete()
+        except: pass
         
         await m.reply_document(final_name)
         await m.reply("✅ **Merge Done.**")
@@ -615,5 +581,18 @@ async def process_merge(c, m, uid, custom, ext):
     except Exception as e: await m.reply(f"❌ Error: {e}")
     await reset_user(uid)
 
-print("🚀 Bot Started on Server...")
+# --- DUMMY WEB SERVER FOR RENDER ---
+web_app = Flask(__name__)
+@web_app.route('/')
+def home():
+    return "Bot is running on Render!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
+
+# Starting Flask in a separate thread
+Thread(target=run_web).start()
+
+print("🚀 Bot Started on Server (With Web Port)...")
 app.run()
