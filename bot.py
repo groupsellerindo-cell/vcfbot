@@ -1,285 +1,619 @@
 import os
+import asyncio
 import re
-import vobject
-import logging
-import time
-from flask import Flask
-from threading import Thread
-from telegram import Update, ReplyKeyboardRemove
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, 
-    filters, ContextTypes, ConversationHandler
-)
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, ForceReply
 
-# --- CONFIG & SECURITY ---
-TOKEN = os.getenv("BOT_TOKEN")
-# Agar OWNER_ID render par set nahi hai toh crash se bachne ke liye 0 default kiya hai
-OWNER_ID = int(os.getenv("OWNER_ID", "0")) 
-ADMINS = [OWNER_ID]
+# --- CONFIGURATION (Environment Variables) ---
+API_ID = int(os.getenv("API_ID", "0")) 
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# States for ConversationHandler
-(TXT_TO_VCF_FILE, TXT_TO_VCF_NAME, TXT_TO_VCF_VCFNAME, 
- VCF_TO_TXT_FILE, VCF_TO_TXT_NAME, MSG_TO_TXT_PROC, 
- RENAME_C_FILE, RENAME_C_NAME, RENAME_F_PROC, 
- SPLIT_PROC_FILE, SPLIT_PROC_NUM, ADMIN_NAVY_PROC) = range(12)
+# --- ADMIN SYSTEM ---
+ADMIN_FILE = "admins.txt"
 
-# --- WEB SERVER (For 24/7 on Render) ---
-app = Flask('')
+def get_admins():
+    admins = {OWNER_ID}
+    if os.path.exists(ADMIN_FILE):
+        with open(ADMIN_FILE, "r") as f:
+            for line in f:
+                if line.strip().isdigit():
+                    admins.add(int(line.strip()))
+    return admins
 
-@app.route('/')
-def home():
-    return "Bot is Running 24/7!"
+def add_admin_to_file(user_id):
+    with open(ADMIN_FILE, "a") as f: f.write(f"{user_id}\n")
 
-def run():
-    # Render requires binding to the $PORT env variable
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, use_reloader=False)
+def remove_admin_from_file(user_id):
+    admins = get_admins()
+    if user_id in admins:
+        admins.remove(user_id)
+        with open(ADMIN_FILE, "w") as f:
+            for admin in admins:
+                if admin != OWNER_ID: f.write(f"{admin}\n")
+    return admins
 
-def keep_alive():
-    t = Thread(target=run)
-    t.daemon = True
-    t.start()
+ADMINS = get_admins()
 
-# --- HELPER: VCF Generator ---
-def generate_vcf(numbers, contact_name, output_name, start_idx=1):
-    path = f"{output_name}.vcf"
-    with open(path, "w", encoding="utf-8") as f:
-        for i, num in enumerate(numbers):
-            f.write("BEGIN:VCARD\nVERSION:3.0\n")
-            f.write(f"FN:{contact_name} {i + start_idx}\n")
-            f.write(f"TEL;TYPE=CELL:{num}\n")
-            f.write("END:VCARD\n")
-    return path
+# --- APP SETUP ---
+if not BOT_TOKEN:
+    print("Error: BOT_TOKEN variable not found!")
+    exit()
+
+app = Client("fast_contact_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# --- STATE MANAGEMENT ---
+user_data = {}
+
+# States
+S_NONE = 0
+S_COLLECTING_T2V = 1
+S_T2V_CONTACT_NAME = 2
+S_T2V_FILE_MODE = 3
+S_T2V_CUSTOM_NAME = 4
+S_COLLECTING_V2T = 5
+S_V2T_MODE = 6
+S_V2T_CUSTOM = 7
+S_COLLECTING_RENAME = 8
+S_RENAME_MODE = 9
+S_RENAME_CUSTOM = 10
+S_MSG_INPUT = 11
+S_MSG_FILENAME = 12
+S_SPLIT_FILE = 13
+S_SPLIT_COUNT = 14
+S_SPLIT_MODE = 15
+S_SPLIT_CUSTOM = 16
+S_NAVY_TEXT = 17
+S_NAVY_FILENAME = 18
+S_COLLECTING_REN_CTC = 19
+S_REN_CTC_NAME = 20
+S_REN_CTC_MODE = 21
+S_REN_CTC_CUSTOM = 22
+S_COLLECTING_MERGE_VCF = 23
+S_MERGE_VCF_MODE = 24
+S_MERGE_VCF_CUSTOM = 25
+S_COLLECTING_MERGE_TXT = 26
+S_MERGE_TXT_MODE = 27
+S_MERGE_TXT_CUSTOM = 28
+
+# --- HELPER FUNCTIONS ---
+def is_admin(user_id):
+    return user_id in ADMINS
+
+async def reset_user(user_id):
+    if user_id in user_data:
+        if 'files' in user_data[user_id]:
+            for f in user_data[user_id]['files']:
+                if os.path.exists(f): os.remove(f)
+        del user_data[user_id]
+
+def clean_contact_name(name):
+    return re.sub(r'\s*\d+$', '', name).strip()
+
+# --- KEYBOARDS ---
+DONE_BTN = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Upload Done / Next", callback_data="done_batch")]])
+NAME_MODE_BTN = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📂 Default Name", callback_data="name_default")],
+    [InlineKeyboardButton("✏️ Custom Name", callback_data="name_custom")]
+])
 
 # --- COMMANDS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return
-    msg = (
-        "🚀 *Fast VCF Manager Pro*\n\n"
-        "*/t2v* - Text to VCF\n"
-        "*/v2t* - VCF to Text\n"
-        "*/m2t* - Message to Text\n"
-        "*/r_c* - Rename Contact Name\n"
-        "*/r_f* - Rename File (Bulk)\n"
-        "*/split* - Split Files\n"
-        "*/navy* - Admin Navy Format\n"
-        "*/reset* - Cancel Process"
+
+@app.on_message(filters.command("start"))
+async def start(client, message):
+    if not is_admin(message.from_user.id): return
+    await message.reply(
+        "⚡ **Professional Batch Bot Ready**\n\n"
+        "**Available Tools:**\n"
+        "➤ **/txt_to_vcf** - Text to VCF (Sequential)\n"
+        "➤ **/vcf_to_txt** - VCF to Text\n"
+        "➤ **/msg_to_txt** - Message to File\n"
+        "➤ **/rename_file** - Bulk Rename Files\n"
+        "➤ **/rename_ctc** - Rename Contact Name (Sequential)\n"
+        "➤ **/merge_vcf** - Merge Multiple VCFs\n"
+        "➤ **/merge_txt** - Merge Multiple TXTs\n"
+        "➤ **/split_file** - Split Big Files\n"
+        "➤ **/admin_navy_file** - Admin Format\n"
+        "➤ **/reset** - Cancel Process"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("🔄 Process Reset.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
+@app.on_message(filters.command("reset"))
+async def reset(client, message):
+    await reset_user(message.from_user.id)
+    await message.reply("🔄 **Process Reset Successfully.**")
 
-# --- 1. TEXT TO VCF ---
-async def t2v_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📁 Send the `.txt` file.")
-    return TXT_TO_VCF_FILE
+# --- ADMIN COMMANDS ---
+@app.on_message(filters.command("addadmin") & filters.user(OWNER_ID))
+async def add_adm(c, m):
+    if len(m.command) > 1:
+        try:
+            uid = int(m.command[1])
+            add_admin_to_file(uid)
+            ADMINS.add(uid)
+            await m.reply(f"✅ **User {uid} added as Admin.**")
+        except: pass
 
-async def t2v_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = await update.message.document.get_file()
-    path = f"downloads/{update.message.document.file_name}"
-    await file.download_to_drive(path)
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        context.user_data['numbers'] = re.findall(r'\d+', f.read())
-    await update.message.reply_text("👤 Enter Contact Name:")
-    return TXT_TO_VCF_NAME
+@app.on_message(filters.command("deladmin") & filters.user(OWNER_ID))
+async def del_adm(c, m):
+    if len(m.command) > 1:
+        try:
+            uid = int(m.command[1])
+            if uid in ADMINS:
+                ADMINS.remove(uid)
+                remove_admin_from_file(uid)
+                await m.reply(f"🗑️ **User {uid} removed from Admin.**")
+        except: pass
 
-async def t2v_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['c_name'] = update.message.text
-    await update.message.reply_text("📄 Enter Output File Name:")
-    return TXT_TO_VCF_VCFNAME
+# --- HANDLERS ---
 
-async def t2v_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    vcf = generate_vcf(context.user_data['numbers'], context.user_data['c_name'], update.message.text)
-    await update.message.reply_document(document=open(vcf, 'rb'))
-    os.remove(vcf)
-    return ConversationHandler.END
+@app.on_message(filters.command("txt_to_vcf"))
+async def t2v_start(c, m):
+    if not is_admin(m.from_user.id): return
+    uid = m.from_user.id
+    user_data[uid] = {'state': S_COLLECTING_T2V, 'files': [], 'original_names': []}
+    await m.reply("📂 **Send Text Files.**\nAuto-delete enabled. Click Done when finished.", reply_markup=DONE_BTN)
 
-# --- 2. VCF TO TEXT ---
-async def v2t_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📁 Send VCF file.")
-    return VCF_TO_TXT_FILE
+@app.on_message(filters.command("rename_ctc"))
+async def ren_ctc_start(c, m):
+    if not is_admin(m.from_user.id): return
+    uid = m.from_user.id
+    user_data[uid] = {'state': S_COLLECTING_REN_CTC, 'files': [], 'original_names': []}
+    await m.reply("📂 **Send VCF Files to Rename Contacts.**\n(Sequence: Name 1, Name 2...)\nClick Done when finished.", reply_markup=DONE_BTN)
 
-async def v2t_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = await update.message.document.get_file()
-    path = f"downloads/{update.message.document.file_name}"
-    await file.download_to_drive(path)
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        nums = re.findall(r'TEL;.*?:(\d+)', f.read())
-    context.user_data['numbers'] = nums
-    await update.message.reply_text("📄 Enter Text File Name:")
-    return VCF_TO_TXT_NAME
+@app.on_message(filters.command("vcf_to_txt"))
+async def v2t_start(c, m):
+    if not is_admin(m.from_user.id): return
+    uid = m.from_user.id
+    user_data[uid] = {'state': S_COLLECTING_V2T, 'files': [], 'original_names': []}
+    await m.reply("📂 **Send VCF Files.**\nClick Done when finished.", reply_markup=DONE_BTN)
 
-async def v2t_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fname = f"{update.message.text}.txt"
-    with open(fname, "w") as f:
-        f.write("\n".join(context.user_data['numbers']))
-    await update.message.reply_document(document=open(fname, 'rb'))
-    os.remove(fname)
-    return ConversationHandler.END
+@app.on_message(filters.command("rename_file"))
+async def ren_start(c, m):
+    if not is_admin(m.from_user.id): return
+    uid = m.from_user.id
+    user_data[uid] = {'state': S_COLLECTING_RENAME, 'files': [], 'exts': [], 'original_names': []}
+    await m.reply("📂 **Send Files to Rename.**\nClick Done when finished.", reply_markup=DONE_BTN)
 
-# --- 3. MESSAGE TO TEXT ---
-async def m2t_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send message with numbers.")
-    return MSG_TO_TXT_PROC
+@app.on_message(filters.command("merge_vcf"))
+async def merge_vcf_start(c, m):
+    if not is_admin(m.from_user.id): return
+    uid = m.from_user.id
+    user_data[uid] = {'state': S_COLLECTING_MERGE_VCF, 'files': []}
+    await m.reply("📂 **Send VCF Files to Merge.**\nClick Done when finished.", reply_markup=DONE_BTN)
 
-async def m2t_proc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    nums = re.findall(r'\d+', update.message.text)
-    fname = "numbers.txt"
-    with open(fname, "w") as f:
-        f.write("\n".join(nums))
-    await update.message.reply_document(document=open(fname, 'rb'))
-    os.remove(fname)
-    return ConversationHandler.END
+@app.on_message(filters.command("merge_txt"))
+async def merge_txt_start(c, m):
+    if not is_admin(m.from_user.id): return
+    uid = m.from_user.id
+    user_data[uid] = {'state': S_COLLECTING_MERGE_TXT, 'files': []}
+    await m.reply("📂 **Send Text Files to Merge.**\nClick Done when finished.", reply_markup=DONE_BTN)
 
-# --- 4. RENAME CONTACT NAME (VCF) ---
-async def rc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send VCF file to rename contacts.")
-    return RENAME_C_FILE
+@app.on_message(filters.command("msg_to_txt"))
+async def m2t_start(c, m):
+    if not is_admin(m.from_user.id): return
+    user_data[m.from_user.id] = {'state': S_MSG_INPUT}
+    await m.reply("📝 **Type your message content below:**", reply_markup=ForceReply(True))
 
-async def rc_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = await update.message.document.get_file()
-    path = f"downloads/{update.message.document.file_name}"
-    await file.download_to_drive(path)
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        nums = re.findall(r'TEL;.*?:(\d+)', f.read())
-    context.user_data['numbers'] = nums
-    await update.message.reply_text(f"Found {len(nums)} contacts. Enter New Name:")
-    return RENAME_C_NAME
+@app.on_message(filters.command("split_file"))
+async def split_start(c, m):
+    if not is_admin(m.from_user.id): return
+    user_data[m.from_user.id] = {'state': S_SPLIT_FILE}
+    await m.reply("✂️ **Send the File you want to split:**")
 
-async def rc_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    vcf = generate_vcf(context.user_data['numbers'], update.message.text, "Renamed_Contacts")
-    await update.message.reply_document(document=open(vcf, 'rb'))
-    os.remove(vcf)
-    return ConversationHandler.END
+@app.on_message(filters.command("admin_navy_file"))
+async def navy_start(c, m):
+    if not is_admin(m.from_user.id): return
+    user_data[m.from_user.id] = {'state': S_NAVY_TEXT}
+    await m.reply("📝 **Send Data in Admin/Navy Format:**", reply_markup=ForceReply(True))
 
-# --- 5. BULK RENAME FILE ---
-async def rf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send file(s). Use /reset when done.")
-    return RENAME_F_PROC
+# --- FILE COLLECTOR ---
+@app.on_message(filters.document)
+async def handle_docs(c, m):
+    uid = m.from_user.id
+    if uid not in user_data: return
+    st = user_data[uid].get('state')
 
-async def rf_proc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.document:
-        doc = update.message.document
-        await update.message.reply_text(f"Renaming {doc.file_name}. Enter new name:")
-        context.user_data['current_file'] = doc
-        return RENAME_F_PROC
-    else:
-        doc = context.user_data.get('current_file')
-        ext = os.path.splitext(doc.file_name)[1]
-        new_name = f"{update.message.text}{ext}"
-        file = await doc.get_file()
-        await file.download_to_drive(new_name)
-        await update.message.reply_document(document=open(new_name, 'rb'))
-        os.remove(new_name)
-        await update.message.reply_text("Done! Send another or /reset.")
-        return RENAME_F_PROC
+    if st in [S_COLLECTING_T2V, S_COLLECTING_V2T, S_COLLECTING_RENAME, S_COLLECTING_REN_CTC]:
+        path = await m.download()
+        user_data[uid]['files'].append(path)
+        base, ext = os.path.splitext(m.document.file_name)
+        user_data[uid]['original_names'].append(base)
+        if st == S_COLLECTING_RENAME: user_data[uid]['exts'].append(ext)
+        try:
+            await m.delete()
+        except:
+            pass
 
-# --- 6. SPLIT MEMBERS ---
-async def split_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send VCF or Text file.")
-    return SPLIT_PROC_FILE
+    elif st in [S_COLLECTING_MERGE_VCF, S_COLLECTING_MERGE_TXT]:
+        path = await m.download()
+        user_data[uid]['files'].append(path)
+        try:
+            await m.delete()
+        except:
+            pass
 
-async def split_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    path = f"downloads/{doc.file_name}"
-    file = await doc.get_file()
-    await file.download_to_drive(path)
+    elif st == S_SPLIT_FILE:
+        msg = await m.reply("🔄 **Analyzing File...**")
+        path = await m.download()
+        base, ext = os.path.splitext(m.document.file_name)
+        try:
+            await m.delete()
+        except:
+            pass
+        
+        is_vcf = path.endswith(".vcf")
+        count = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            count = content.count("BEGIN:VCARD") if is_vcf else len(content.splitlines())
+        
+        user_data[uid].update({'state': S_SPLIT_COUNT, 'path': path, 'is_vcf': is_vcf, 'total_items': count, 'original_name': base})
+        try:
+            await msg.delete() 
+        except:
+            pass
+        await m.reply(f"📊 **Analysis Complete.**\n\n**Total Numbers:** `{count}`\n\n🔢 **Enter how many per file?**")
+
+# --- CALLBACKS ---
+@app.on_callback_query()
+async def cb_handler(c, q):
+    uid = q.from_user.id
+    if uid not in user_data: return await q.answer("Session expired.")
+    st = user_data[uid].get('state')
+    data = q.data
+
+    if data == "done_batch":
+        if st in [S_COLLECTING_T2V, S_COLLECTING_V2T, S_COLLECTING_RENAME, S_COLLECTING_REN_CTC, S_COLLECTING_MERGE_VCF, S_COLLECTING_MERGE_TXT]:
+             if not user_data[uid]['files']: return await q.answer("❌ No files!", show_alert=True)
+
+        if st == S_COLLECTING_T2V:
+            user_data[uid]['state'] = S_T2V_CONTACT_NAME
+            await q.message.edit(f"✅ **Files Received.**\n\n👤 **Enter Contact Name Base:**\n(e.g., if you type 'Flame', contacts will be Flame 1, Flame 2...)")
+        elif st == S_COLLECTING_V2T:
+            user_data[uid]['state'] = S_V2T_MODE
+            await q.message.edit("📝 **Select Output File Name Mode:**", reply_markup=NAME_MODE_BTN)
+        elif st == S_COLLECTING_RENAME:
+            user_data[uid]['state'] = S_RENAME_MODE
+            await q.message.edit("📝 **Select Renaming Mode:**", reply_markup=NAME_MODE_BTN)
+        elif st == S_COLLECTING_REN_CTC:
+            user_data[uid]['state'] = S_REN_CTC_NAME
+            await q.message.edit(f"✅ **Files Received.**\n\n👤 **Enter New Contact Name Base:**\n(Contacts will become Name 1, Name 2...)")
+        elif st == S_COLLECTING_MERGE_VCF:
+            user_data[uid]['state'] = S_MERGE_VCF_MODE
+            await q.message.edit("📝 **Select Merged File Name Mode:**", reply_markup=NAME_MODE_BTN)
+        elif st == S_COLLECTING_MERGE_TXT:
+            user_data[uid]['state'] = S_MERGE_TXT_MODE
+            await q.message.edit("📝 **Select Merged File Name Mode:**", reply_markup=NAME_MODE_BTN)
+
+    elif data == "name_default":
+        if st == S_T2V_FILE_MODE: await process_t2v(c, q.message, uid, False)
+        elif st == S_V2T_MODE:    await process_v2t(c, q.message, uid, False)
+        elif st == S_RENAME_MODE: await process_rename(c, q.message, uid, False)
+        elif st == S_SPLIT_MODE:  await process_split(c, q.message, uid, False)
+        elif st == S_REN_CTC_MODE: await process_ren_ctc(c, q.message, uid, False)
+        elif st == S_MERGE_VCF_MODE: await process_merge(c, q.message, uid, False, ".vcf")
+        elif st == S_MERGE_TXT_MODE: await process_merge(c, q.message, uid, False, ".txt")
+
+    elif data == "name_custom":
+        msg_text = "✏️ **Enter Custom File Name:**"
+        if st == S_T2V_FILE_MODE:
+            user_data[uid]['state'] = S_T2V_CUSTOM_NAME; await q.message.edit(msg_text)
+        elif st == S_V2T_MODE:
+            user_data[uid]['state'] = S_V2T_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_RENAME_MODE:
+            user_data[uid]['state'] = S_RENAME_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_SPLIT_MODE:
+            user_data[uid]['state'] = S_SPLIT_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_REN_CTC_MODE:
+            user_data[uid]['state'] = S_REN_CTC_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_MERGE_VCF_MODE:
+            user_data[uid]['state'] = S_MERGE_VCF_CUSTOM; await q.message.edit(msg_text)
+        elif st == S_MERGE_TXT_MODE:
+            user_data[uid]['state'] = S_MERGE_TXT_CUSTOM; await q.message.edit(msg_text)
+
+# --- TEXT HANDLER ---
+@app.on_message(filters.text)
+async def text_handler(c, m):
+    uid = m.from_user.id
+    if uid not in user_data: return
+    st = user_data[uid].get('state')
+
+    if st == S_T2V_CONTACT_NAME:
+        raw_name = m.text
+        user_data[uid]['c_name'] = clean_contact_name(raw_name)
+        user_data[uid]['state'] = S_T2V_FILE_MODE
+        await m.reply(f"📝 **Base Name Set:** `{user_data[uid]['c_name']}`\nContacts will be {user_data[uid]['c_name']} 1, {user_data[uid]['c_name']} 2...\n\n**Select Output File Name Mode:**", reply_markup=NAME_MODE_BTN)
     
-    if path.endswith('.vcf'):
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = re.findall(r'BEGIN:VCARD.*?END:VCARD', f.read(), re.S)
-    else:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-            
-    context.user_data['lines'] = lines
-    context.user_data['ext'] = "vcf" if path.endswith('.vcf') else "txt"
-    await update.message.reply_text(f"Total: {len(lines)}. Per file limit?")
-    return SPLIT_PROC_NUM
+    elif st == S_REN_CTC_NAME:
+        raw_name = m.text
+        user_data[uid]['c_name'] = clean_contact_name(raw_name)
+        user_data[uid]['state'] = S_REN_CTC_MODE
+        await m.reply(f"📝 **Base Name Set:** `{user_data[uid]['c_name']}`\n\n**Select Output File Name Mode:**", reply_markup=NAME_MODE_BTN)
 
-async def split_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif st == S_T2V_CUSTOM_NAME:
+        user_data[uid]['custom_name'] = m.text; await process_t2v(c, m, uid, True)
+    elif st == S_V2T_CUSTOM:
+        user_data[uid]['custom_name'] = m.text; await process_v2t(c, m, uid, True)
+    elif st == S_RENAME_CUSTOM:
+        user_data[uid]['custom_name'] = m.text; await process_rename(c, m, uid, True)
+    elif st == S_REN_CTC_CUSTOM:
+        user_data[uid]['custom_name'] = m.text; await process_ren_ctc(c, m, uid, True)
+    elif st == S_MERGE_VCF_CUSTOM:
+        user_data[uid]['custom_name'] = m.text; await process_merge(c, m, uid, True, ".vcf")
+    elif st == S_MERGE_TXT_CUSTOM:
+        user_data[uid]['custom_name'] = m.text; await process_merge(c, m, uid, True, ".txt")
+
+    elif st == S_MSG_INPUT:
+        user_data[uid]['msg_content'] = m.text
+        user_data[uid]['state'] = S_MSG_FILENAME
+        await m.reply("📝 **Enter File Name:**")
+    elif st == S_MSG_FILENAME:
+        fname = m.text.strip()
+        if not fname.endswith(".txt"): fname += ".txt"
+        
+        # Adding + logically for Message to TXT if lines contain numbers
+        msg_content = user_data[uid]['msg_content']
+        new_content = ""
+        for line in msg_content.splitlines():
+            line = line.strip()
+            if line.replace('+', '').isdigit():
+                new_content += "+" + line.replace('+', '') + "\n"
+            else:
+                new_content += line + "\n"
+
+        with open(fname, 'w', encoding='utf-8') as f: f.write(new_content)
+        await m.reply_document(fname)
+        await m.reply("✅ **Done!**")
+        os.remove(fname)
+        await reset_user(uid)
+        
+    elif st == S_SPLIT_COUNT:
+        try:
+            count = int(m.text)
+            user_data[uid]['split_count'] = count
+            user_data[uid]['state'] = S_SPLIT_MODE
+            await m.reply("📝 **Select Output File Name Mode:**", reply_markup=NAME_MODE_BTN)
+        except: await m.reply("❌ **Please enter a valid number.**")
+    elif st == S_SPLIT_CUSTOM:
+        user_data[uid]['custom_name'] = m.text
+        await process_split(c, m, uid, True)
+    
+    elif st == S_NAVY_TEXT:
+        user_data[uid]['text'] = m.text
+        user_data[uid]['state'] = S_NAVY_FILENAME
+        await m.reply("📝 **Enter Output File Name:**")
+    elif st == S_NAVY_FILENAME:
+        fname = m.text.strip() + ".vcf"
+        raw = user_data[uid]['text']
+        vcf, tn = "", None
+        for l in raw.splitlines():
+            l=l.strip()
+            if not l: continue
+            if l.replace('+','').isdigit() and len(l)>5:
+                if tn:
+                    # Plus Sign Magic Here
+                    clean_num = "+" + l.replace('+', '')
+                    vcf+=f"BEGIN:VCARD\nVERSION:3.0\nFN:{tn}\nTEL;TYPE=CELL:{clean_num}\nEND:VCARD\n"
+                    tn=None
+            else: tn=l
+        with open(fname,'w',encoding='utf-8') as f: f.write(vcf)
+        await m.reply_document(fname)
+        await m.reply("✅ **Done!**")
+        os.remove(fname)
+        await reset_user(uid)
+
+# --- PROCESSORS ---
+
+async def process_t2v(c, m, uid, custom):
+    proc_msg = await m.reply("⚙️ **Processing with Sequential Names & Plus Sign...**")
     try:
-        limit = int(update.message.text)
-        lines = context.user_data['lines']
-        ext = context.user_data['ext']
-        for i in range(0, len(lines), limit):
-            chunk = lines[i:i + limit]
-            fname = f"Part_{i//limit + 1}.{ext}"
-            with open(fname, 'w', encoding='utf-8') as f:
-                if ext == 'vcf': f.write("\n".join(chunk))
-                else: f.writelines(chunk)
-            await update.message.reply_document(document=open(fname, 'rb'))
-            os.remove(fname)
-        return ConversationHandler.END
-    except:
-        await update.message.reply_text("Invalid number.")
+        files = user_data[uid]['files']
+        c_name_base = user_data[uid]['c_name']
+        
+        for i, path in enumerate(files):
+            out_name = f"{user_data[uid].get('custom_name')} {i+1}.vcf" if custom else f"{user_data[uid]['original_names'][i]}.vcf"
+            
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f: lines = f.readlines()
+            data = ""
+            
+            counter = 1
+            for num in lines:
+                num = num.strip()
+                if num: 
+                    # Plus Sign Magic Here
+                    clean_num = "+" + num.replace('+', '')
+                    data += f"BEGIN:VCARD\nVERSION:3.0\nFN:{c_name_base} {counter}\nTEL;TYPE=CELL:{clean_num}\nEND:VCARD\n"
+                    counter += 1
+            
+            with open(out_name, 'w', encoding='utf-8') as f: f.write(data)
+            await m.reply_document(out_name)
+            
+            if i == 0:
+                try:
+                    await proc_msg.delete()
+                except:
+                    pass
+            
+            os.remove(out_name)
+            os.remove(path)
+            
+        await m.reply("✅ **All Files Done.**")
+    except Exception as e: await m.reply(f"❌ Error: {e}")
+    await reset_user(uid)
 
-# --- 8. ADMIN NAVY ---
-async def navy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send list (Admin/Navy format):")
-    return ADMIN_NAVY_PROC
-
-async def navy_proc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = update.message.text.split('\n')
-    vcf_str, curr_name = "", "Contact"
-    for line in lines:
-        line = line.strip().replace("+", "")
-        if not line: continue
-        if line.isdigit():
-            vcf_str += f"BEGIN:VCARD\nVERSION:3.0\nFN:{curr_name}\nTEL;TYPE=CELL:{line}\nEND:VCARD\n"
-        else: curr_name = line
-    with open("Navy.vcf", "w", encoding='utf-8') as f: f.write(vcf_str)
-    await update.message.reply_document(document=open("Navy.vcf", 'rb'))
-    os.remove("Navy.vcf")
-    return ConversationHandler.END
-
-# --- MAIN ---
-def main():
-    if not os.path.exists("downloads"): os.makedirs("downloads")
+async def process_ren_ctc(c, m, uid, custom):
+    proc_msg = await m.reply("⚙️ **Renaming Contacts (Sequential) & Adding Plus Sign...**")
+    files = user_data[uid]['files']
+    new_c_name_base = user_data[uid]['c_name']
     
-    # Keep Alive server ko pehle start karo aur thoda wait karo
-    keep_alive()
-    time.sleep(1) # Isse Flask pehle port bind kar lega
-    
-    app_tg = Application.builder().token(TOKEN).build()
+    try:
+        for i, path in enumerate(files):
+            out_name = f"{user_data[uid].get('custom_name')} {i+1}.vcf" if custom else f"{user_data[uid]['original_names'][i]}.vcf"
+            
+            new_content = ""
+            counter = 1
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.startswith("FN:"):
+                        new_content += f"FN:{new_c_name_base} {counter}\n"
+                        counter += 1
+                    elif "TEL" in line and ":" in line:
+                        # Plus Sign Magic Here
+                        parts = line.split(":", 1)
+                        clean_num = "+" + parts[1].strip().replace('+', '')
+                        new_content += f"{parts[0]}:{clean_num}\n"
+                    else:
+                        new_content += line
+            
+            with open(out_name, 'w', encoding='utf-8') as f: f.write(new_content)
+            await m.reply_document(out_name)
+            
+            if i == 0:
+                try:
+                    await proc_msg.delete()
+                except:
+                    pass
+            
+            os.remove(out_name)
+            os.remove(path)
+            
+        await m.reply("✅ **All Files Done.**")
+    except Exception as e: await m.reply(f"❌ Error: {e}")
+    await reset_user(uid)
 
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler('t2v', t2v_start),
-            CommandHandler('v2t', v2t_start),
-            CommandHandler('m2t', m2t_start),
-            CommandHandler('r_c', rc_start),
-            CommandHandler('r_f', rf_start),
-            CommandHandler('split', split_start),
-            CommandHandler('navy', navy_start)
-        ],
-        states={
-            TXT_TO_VCF_FILE: [MessageHandler(filters.Document.ALL, t2v_file)],
-            TXT_TO_VCF_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, t2v_name)],
-            TXT_TO_VCF_VCFNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, t2v_final)],
-            VCF_TO_TXT_FILE: [MessageHandler(filters.Document.ALL, v2t_file)],
-            VCF_TO_TXT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, v2t_final)],
-            MSG_TO_TXT_PROC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m2t_proc)],
-            RENAME_C_FILE: [MessageHandler(filters.Document.ALL, rc_file)],
-            RENAME_C_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rc_final)],
-            RENAME_F_PROC: [MessageHandler(filters.Document.ALL | filters.TEXT, rf_proc)],
-            SPLIT_PROC_FILE: [MessageHandler(filters.Document.ALL, split_file)],
-            SPLIT_PROC_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, split_final)],
-            ADMIN_NAVY_PROC: [MessageHandler(filters.TEXT & ~filters.COMMAND, navy_proc)]
-        },
-        fallbacks=[CommandHandler('reset', reset)]
-    )
+async def process_split(c, m, uid, custom):
+    proc_msg = await m.reply("⚙️ **Splitting & Checking Plus Sign...**")
+    try:
+        path = user_data[uid]['path']
+        limit = user_data[uid]['split_count']
+        is_vcf = user_data[uid]['is_vcf']
+        
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f: content = f.read()
 
-    app_tg.add_handler(CommandHandler("start", start))
-    app_tg.add_handler(CommandHandler("reset", reset))
-    app_tg.add_handler(conv)
-    
-    print("Bot is alive and polling...")
-    app_tg.run_polling()
+        if is_vcf:
+            # Add Plus Sign to all VCF Numbers
+            content = re.sub(r'(TEL.*?:)\s*\+?(\d+)', r'\1+\2', content)
+            items = [x+"END:VCARD\n" for x in content.strip().split("END:VCARD") if "BEGIN:VCARD" in x]
+            ext = ".vcf"
+        else:
+            # Add Plus Sign to all TXT Numbers
+            raw_items = content.splitlines()
+            items = []
+            for x in raw_items:
+                x = x.strip()
+                if x:
+                    if x.replace('+', '').isdigit():
+                        items.append("+" + x.replace('+', '') + "\n")
+                    else:
+                        items.append(x + "\n")
+            ext = ".txt"
 
-if __name__ == "__main__":
-    main()
+        total = (len(items)+limit-1)//limit
+        for i in range(total):
+            chunk = items[i*limit:(i+1)*limit]
+            out_name = f"{user_data[uid].get('custom_name')} {i+1}{ext}" if custom else f"{user_data[uid]['original_name']} {i+1}{ext}"
+            
+            with open(out_name, 'w', encoding='utf-8') as f: f.writelines(chunk)
+            await m.reply_document(out_name)
+            
+            if i == 0:
+                try:
+                    await proc_msg.delete()
+                except:
+                    pass
+            
+            os.remove(out_name)
+        os.remove(path)
+        await m.reply("✅ **All Files Done.**")
+    except Exception as e: await m.reply(f"❌ Error: {e}")
+    await reset_user(uid)
+
+async def process_v2t(c, m, uid, custom):
+    proc_msg = await m.reply("⚙️ **Processing & Adding Plus Sign...**")
+    try:
+        files = user_data[uid]['files']
+        for i, path in enumerate(files):
+            out_name = f"{user_data[uid].get('custom_name')} {i+1}.txt" if custom else f"{user_data[uid]['original_names'][i]}.txt"
+            nums = []
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                for l in f:
+                    if "TEL" in l: 
+                        raw_num = l.split(':')[-1].strip()
+                        # Plus Sign Magic Here
+                        clean_num = "+" + raw_num.replace('+', '')
+                        nums.append(clean_num)
+            
+            with open(out_name, 'w', encoding='utf-8') as f: f.write("\n".join(nums))
+            await m.reply_document(out_name)
+            
+            if i == 0:
+                try:
+                    await proc_msg.delete()
+                except:
+                    pass
+            
+            os.remove(out_name)
+            os.remove(path)
+        await m.reply("✅ **All Files Done.**")
+    except Exception as e: await m.reply(f"❌ Error: {e}")
+    await reset_user(uid)
+
+async def process_rename(c, m, uid, custom):
+    proc_msg = await m.reply("⚙️ **Processing...**")
+    try:
+        files = user_data[uid]['files']
+        for i, path in enumerate(files):
+            ext = user_data[uid]['exts'][i]
+            new_name = f"{user_data[uid].get('custom_name')} {i+1}{ext}" if custom else f"{user_data[uid]['original_names'][i]}{ext}"
+            os.rename(path, new_name)
+            await m.reply_document(new_name)
+            
+            if i == 0:
+                try:
+                    await proc_msg.delete()
+                except:
+                    pass
+            
+            os.remove(new_name)
+        await m.reply("✅ **All Files Done.**")
+    except Exception as e: await m.reply(f"❌ Error: {e}")
+    await reset_user(uid)
+
+async def process_merge(c, m, uid, custom, ext):
+    proc_msg = await m.reply("⚙️ **Processing Merge & Checking Plus Sign...**")
+    files = user_data[uid]['files']
+    final_name = f"{user_data[uid].get('custom_name')}{ext}" if custom else f"Merged_Output{ext}"
+    try:
+        with open(final_name, 'w', encoding='utf-8') as outfile:
+            for path in files:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as infile:
+                    if ext == ".vcf":
+                        content = infile.read()
+                        # Add Plus Sign to VCF Numbers
+                        content = re.sub(r'(TEL.*?:)\s*\+?(\d+)', r'\1+\2', content)
+                        outfile.write(content)
+                    else:
+                        for line in infile:
+                            line = line.strip()
+                            if line:
+                                # Add Plus Sign to TXT Numbers
+                                if line.replace('+', '').isdigit():
+                                    outfile.write("+" + line.replace('+', '') + "\n")
+                                else:
+                                    outfile.write(line + "\n")
+                os.remove(path)
+        
+        try:
+            await proc_msg.delete()
+        except:
+            pass
+        
+        await m.reply_document(final_name)
+        await m.reply("✅ **Merge Done.**")
+        os.remove(final_name)
+    except Exception as e: await m.reply(f"❌ Error: {e}")
+    await reset_user(uid)
+
+print("🚀 Bot Started on Server...")
+app.run()
