@@ -93,6 +93,20 @@ async def reset_user(user_id):
 def clean_contact_name(name):
     return re.sub(r'\s*\d+$', '', name).strip()
 
+# SMART NAMING LOGIC
+def get_next_filename(base_name, index, ext):
+    if not base_name: return f"File_{index+1}{ext}"
+    # Agar end me number hai toh usko find karo (jaise GVF78 me 78)
+    match = re.search(r'(\d+)$', base_name)
+    if match:
+        num_str = match.group(1)
+        prefix = base_name[:-len(num_str)]
+        new_num = int(num_str) + index
+        return f"{prefix}{str(new_num).zfill(len(num_str))}{ext}"
+    else:
+        # Agar number nahi hai toh 1, 2, 3 lagao
+        return f"{base_name} {index+1}{ext}"
+
 # --- KEYBOARDS ---
 DONE_BTN = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Upload Done / Next", callback_data="done_batch")]])
 NAME_MODE_BTN = InlineKeyboardMarkup([
@@ -108,11 +122,11 @@ async def start(client, message):
     await message.reply(
         "⚡ **Professional Batch Bot Ready**\n\n"
         "**Available Tools:**\n"
-        "➤ **/txt_to_vcf** - Text to VCF (Sequential)\n"
+        "➤ **/txt_to_vcf** - Text to VCF \n"
         "➤ **/vcf_to_txt** - VCF to Text\n"
-        "➤ **/msg_to_txt** - Message to File\n"
+        "➤ **/msg_to_txt** - Message to TXT File\n"
         "➤ **/rename_file** - Bulk Rename Files\n"
-        "➤ **/rename_ctc** - Rename Contact Name (Sequential)\n"
+        "➤ **/rename_ctc** - Rename Contact Name \n"
         "➤ **/merge_vcf** - Merge Multiple VCFs\n"
         "➤ **/merge_txt** - Merge Multiple TXTs\n"
         "➤ **/split_file** - Split Big Files\n"
@@ -161,7 +175,7 @@ async def ren_ctc_start(c, m):
     if not is_admin(m.from_user.id): return
     uid = m.from_user.id
     user_data[uid] = {'state': S_COLLECTING_REN_CTC, 'files': [], 'original_names': []}
-    await m.reply("📂 **Send VCF Files to Rename Contacts.**\n(Sequence: Name 1, Name 2...)\nClick Done when finished.", reply_markup=DONE_BTN)
+    await m.reply("📂 **Send VCF Files to Rename Contacts.**\nClick Done when finished.", reply_markup=DONE_BTN)
 
 @app.on_message(filters.command("vcf_to_txt"))
 async def v2t_start(c, m):
@@ -263,7 +277,7 @@ async def cb_handler(c, q):
 
         if st == S_COLLECTING_T2V:
             user_data[uid]['state'] = S_T2V_CONTACT_NAME
-            await q.message.edit(f"✅ **Files Received.**\n\n👤 **Enter Contact Name Base:**\n(e.g., if you type 'Flame', contacts will be Flame 1, Flame 2...)")
+            await q.message.edit(f"✅ **Files Received.**\n\n👤 **Enter Contact Name Base:**")
         elif st == S_COLLECTING_V2T:
             user_data[uid]['state'] = S_V2T_MODE
             await q.message.edit("📝 **Select Output File Name Mode:**", reply_markup=NAME_MODE_BTN)
@@ -272,7 +286,7 @@ async def cb_handler(c, q):
             await q.message.edit("📝 **Select Renaming Mode:**", reply_markup=NAME_MODE_BTN)
         elif st == S_COLLECTING_REN_CTC:
             user_data[uid]['state'] = S_REN_CTC_NAME
-            await q.message.edit(f"✅ **Files Received.**\n\n👤 **Enter New Contact Name Base:**\n(Contacts will become Name 1, Name 2...)")
+            await q.message.edit(f"✅ **Files Received.**\n\n👤 **Enter New Contact Name Base:**")
         elif st == S_COLLECTING_MERGE_VCF:
             user_data[uid]['state'] = S_MERGE_VCF_MODE
             await q.message.edit("📝 **Select Merged File Name Mode:**", reply_markup=NAME_MODE_BTN)
@@ -290,7 +304,7 @@ async def cb_handler(c, q):
         elif st == S_MERGE_TXT_MODE: await process_merge(c, q.message, uid, False, ".txt")
 
     elif data == "name_custom":
-        msg_text = "✏️ **Enter Custom File Name:**"
+        msg_text = "✏️ **Enter Custom File Name:**\n(Example: Type GVF78, it will become GVF78, GVF79...)"
         if st == S_T2V_FILE_MODE: user_data[uid]['state'] = S_T2V_CUSTOM_NAME; await q.message.edit(msg_text)
         elif st == S_V2T_MODE: user_data[uid]['state'] = S_V2T_CUSTOM; await q.message.edit(msg_text)
         elif st == S_RENAME_MODE: user_data[uid]['state'] = S_RENAME_CUSTOM; await q.message.edit(msg_text)
@@ -310,7 +324,7 @@ async def text_handler(c, m):
         raw_name = m.text
         user_data[uid]['c_name'] = clean_contact_name(raw_name)
         user_data[uid]['state'] = S_T2V_FILE_MODE
-        await m.reply(f"📝 **Base Name Set:** `{user_data[uid]['c_name']}`\nContacts will be {user_data[uid]['c_name']} 1, {user_data[uid]['c_name']} 2...\n\n**Select Output File Name Mode:**", reply_markup=NAME_MODE_BTN)
+        await m.reply(f"📝 **Base Name Set:** `{user_data[uid]['c_name']}`\n\n**Select Output File Name Mode:**", reply_markup=NAME_MODE_BTN)
     
     elif st == S_REN_CTC_NAME:
         raw_name = m.text
@@ -397,7 +411,8 @@ async def process_t2v(c, m, uid, custom):
         c_name_base = user_data[uid]['c_name']
         
         for i, path in enumerate(files):
-            out_name = f"{user_data[uid].get('custom_name')} {i+1}.vcf" if custom else f"{user_data[uid]['original_names'][i]}.vcf"
+            # NEW NAMING LOGIC APPLIED HERE
+            out_name = get_next_filename(user_data[uid].get('custom_name'), i, ".vcf") if custom else f"{user_data[uid]['original_names'][i]}.vcf"
             
             with open(path, 'r', encoding='utf-8', errors='ignore') as f: lines = f.readlines()
             data = ""
@@ -431,7 +446,8 @@ async def process_ren_ctc(c, m, uid, custom):
     
     try:
         for i, path in enumerate(files):
-            out_name = f"{user_data[uid].get('custom_name')} {i+1}.vcf" if custom else f"{user_data[uid]['original_names'][i]}.vcf"
+            # NEW NAMING LOGIC APPLIED HERE
+            out_name = get_next_filename(user_data[uid].get('custom_name'), i, ".vcf") if custom else f"{user_data[uid]['original_names'][i]}.vcf"
             
             new_content = ""
             counter = 1
@@ -489,7 +505,8 @@ async def process_split(c, m, uid, custom):
         total = (len(items)+limit-1)//limit
         for i in range(total):
             chunk = items[i*limit:(i+1)*limit]
-            out_name = f"{user_data[uid].get('custom_name')} {i+1}{ext}" if custom else f"{user_data[uid]['original_name']} {i+1}{ext}"
+            # NEW NAMING LOGIC APPLIED HERE
+            out_name = get_next_filename(user_data[uid].get('custom_name'), i, ext) if custom else get_next_filename(user_data[uid]['original_name'], i, ext)
             
             with open(out_name, 'w', encoding='utf-8') as f: f.writelines(chunk)
             await m.reply_document(out_name)
@@ -509,7 +526,8 @@ async def process_v2t(c, m, uid, custom):
     try:
         files = user_data[uid]['files']
         for i, path in enumerate(files):
-            out_name = f"{user_data[uid].get('custom_name')} {i+1}.txt" if custom else f"{user_data[uid]['original_names'][i]}.txt"
+            # NEW NAMING LOGIC APPLIED HERE
+            out_name = get_next_filename(user_data[uid].get('custom_name'), i, ".txt") if custom else f"{user_data[uid]['original_names'][i]}.txt"
             nums = []
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 for l in f:
@@ -537,7 +555,8 @@ async def process_rename(c, m, uid, custom):
         files = user_data[uid]['files']
         for i, path in enumerate(files):
             ext = user_data[uid]['exts'][i]
-            new_name = f"{user_data[uid].get('custom_name')} {i+1}{ext}" if custom else f"{user_data[uid]['original_names'][i]}{ext}"
+            # NEW NAMING LOGIC APPLIED HERE
+            new_name = get_next_filename(user_data[uid].get('custom_name'), i, ext) if custom else f"{user_data[uid]['original_names'][i]}{ext}"
             os.rename(path, new_name)
             await m.reply_document(new_name)
             
@@ -553,6 +572,7 @@ async def process_rename(c, m, uid, custom):
 async def process_merge(c, m, uid, custom, ext):
     proc_msg = await m.reply("⚙️ **Processing Merge & Checking Plus Sign...**")
     files = user_data[uid]['files']
+    # Merge file ka naam single hi hota hai, toh usme increment ki jarurat nahi hoti
     final_name = f"{user_data[uid].get('custom_name')}{ext}" if custom else f"Merged_Output{ext}"
     try:
         with open(final_name, 'w', encoding='utf-8') as outfile:
