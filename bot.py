@@ -2,6 +2,7 @@ import os
 import re
 import vobject
 import logging
+import time
 from flask import Flask
 from threading import Thread
 from telegram import Update, ReplyKeyboardRemove
@@ -12,7 +13,7 @@ from telegram.ext import (
 
 # --- CONFIG & SECURITY ---
 TOKEN = os.getenv("BOT_TOKEN")
-# Default to 0 if not set to prevent crash; ensure you set this in Render!
+# Agar OWNER_ID render par set nahi hai toh crash se bachne ke liye 0 default kiya hai
 OWNER_ID = int(os.getenv("OWNER_ID", "0")) 
 ADMINS = [OWNER_ID]
 
@@ -32,7 +33,7 @@ def home():
 def run():
     # Render requires binding to the $PORT env variable
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 def keep_alive():
     t = Thread(target=run)
@@ -45,7 +46,6 @@ def generate_vcf(numbers, contact_name, output_name, start_idx=1):
     with open(path, "w", encoding="utf-8") as f:
         for i, num in enumerate(numbers):
             f.write("BEGIN:VCARD\nVERSION:3.0\n")
-            # Sequential naming: Contact 1, Contact 2, etc.
             f.write(f"FN:{contact_name} {i + start_idx}\n")
             f.write(f"TEL;TYPE=CELL:{num}\n")
             f.write("END:VCARD\n")
@@ -135,6 +135,27 @@ async def m2t_proc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.remove(fname)
     return ConversationHandler.END
 
+# --- 4. RENAME CONTACT NAME (VCF) ---
+async def rc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send VCF file to rename contacts.")
+    return RENAME_C_FILE
+
+async def rc_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = await update.message.document.get_file()
+    path = f"downloads/{update.message.document.file_name}"
+    await file.download_to_drive(path)
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        nums = re.findall(r'TEL;.*?:(\d+)', f.read())
+    context.user_data['numbers'] = nums
+    await update.message.reply_text(f"Found {len(nums)} contacts. Enter New Name:")
+    return RENAME_C_NAME
+
+async def rc_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vcf = generate_vcf(context.user_data['numbers'], update.message.text, "Renamed_Contacts")
+    await update.message.reply_document(document=open(vcf, 'rb'))
+    os.remove(vcf)
+    return ConversationHandler.END
+
 # --- 5. BULK RENAME FILE ---
 async def rf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send file(s). Use /reset when done.")
@@ -188,7 +209,7 @@ async def split_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i in range(0, len(lines), limit):
             chunk = lines[i:i + limit]
             fname = f"Part_{i//limit + 1}.{ext}"
-            with open(fname, 'w') as f:
+            with open(fname, 'w', encoding='utf-8') as f:
                 if ext == 'vcf': f.write("\n".join(chunk))
                 else: f.writelines(chunk)
             await update.message.reply_document(document=open(fname, 'rb'))
@@ -211,7 +232,7 @@ async def navy_proc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if line.isdigit():
             vcf_str += f"BEGIN:VCARD\nVERSION:3.0\nFN:{curr_name}\nTEL;TYPE=CELL:{line}\nEND:VCARD\n"
         else: curr_name = line
-    with open("Navy.vcf", "w") as f: f.write(vcf_str)
+    with open("Navy.vcf", "w", encoding='utf-8') as f: f.write(vcf_str)
     await update.message.reply_document(document=open("Navy.vcf", 'rb'))
     os.remove("Navy.vcf")
     return ConversationHandler.END
@@ -219,7 +240,10 @@ async def navy_proc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- MAIN ---
 def main():
     if not os.path.exists("downloads"): os.makedirs("downloads")
+    
+    # Keep Alive server ko pehle start karo aur thoda wait karo
     keep_alive()
+    time.sleep(1) # Isse Flask pehle port bind kar lega
     
     app_tg = Application.builder().token(TOKEN).build()
 
@@ -228,6 +252,7 @@ def main():
             CommandHandler('t2v', t2v_start),
             CommandHandler('v2t', v2t_start),
             CommandHandler('m2t', m2t_start),
+            CommandHandler('r_c', rc_start),
             CommandHandler('r_f', rf_start),
             CommandHandler('split', split_start),
             CommandHandler('navy', navy_start)
@@ -239,6 +264,8 @@ def main():
             VCF_TO_TXT_FILE: [MessageHandler(filters.Document.ALL, v2t_file)],
             VCF_TO_TXT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, v2t_final)],
             MSG_TO_TXT_PROC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m2t_proc)],
+            RENAME_C_FILE: [MessageHandler(filters.Document.ALL, rc_file)],
+            RENAME_C_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rc_final)],
             RENAME_F_PROC: [MessageHandler(filters.Document.ALL | filters.TEXT, rf_proc)],
             SPLIT_PROC_FILE: [MessageHandler(filters.Document.ALL, split_file)],
             SPLIT_PROC_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, split_final)],
@@ -251,6 +278,7 @@ def main():
     app_tg.add_handler(CommandHandler("reset", reset))
     app_tg.add_handler(conv)
     
+    print("Bot is alive and polling...")
     app_tg.run_polling()
 
 if __name__ == "__main__":
