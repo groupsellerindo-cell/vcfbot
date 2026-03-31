@@ -1,4 +1,3 @@
-python-telegram-bot
-vobject
-flask
-gunicorn
+pyrogram
+tgcrypto
+uvloop
